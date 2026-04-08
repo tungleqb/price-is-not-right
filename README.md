@@ -110,3 +110,206 @@ From the openpi directory:
 ```bash
 docker compose -f examples/robosuite/compose.yml up
 ```
+
+---
+
+## Training Pipeline
+
+This section describes the end-to-end processing pipeline for training the **neuro-symbolic method** — the new approach proposed in this work. The pipeline decomposes long-horizon manipulation tasks into symbolic plans executed by a library of learned skill policies.
+
+### Pipeline Overview
+
+```
+Robosuite Simulation Environment
+            │
+            ▼
+  ┌─────────────────────┐
+  │  Symbolic Planner   │  (Metric-FF + PDDL domain/problem files)
+  │  PDDL → Action Plan │  planning/PDDL/<env>/
+  └─────────┬───────────┘
+            │ action sequence (reach_pick, grasp, reach_place, drop, …)
+            ▼
+  ┌─────────────────────┐
+  │  Oracle Demo        │  dataset_making/main.py
+  │  Collector          │  records (obs, action, keypoint) per skill
+  └─────────┬───────────┘
+            │ datasets/<exp>/<id>/traces/<skill>.zip  (data.pkl inside)
+            ▼
+  ┌─────────────────────┐
+  │  Data Preprocessing │  neuro_symbolic_method/data_processing/data_to_zarr.py
+  │  ZIP → Zarr         │  groups transitions by skill type
+  └─────────┬───────────┘
+            │ hf_traj/<skill>/keypoint/keypoint.zarr
+            ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │                   Parallel Model Training                    │
+  │                                                              │
+  │  ┌─────────────────────┐   ┌────────────────────────────┐   │
+  │  │  Object Detection   │   │  Diffusion Skill Policies  │   │
+  │  │  (YOLOv8 + Regr.)   │   │  (one per skill primitive) │   │
+  │  │                     │   │                            │   │
+  │  │  Images → .pt model │   │  Zarr dataset → .ckpt      │   │
+  │  │  BBoxes → .pkl regr │   │  (reach_pick, grasp,       │   │
+  │  │                     │   │   reach_place, drop)       │   │
+  │  └──────────┬──────────┘   └───────────┬────────────────┘   │
+  └─────────────┼──────────────────────────┼────────────────────┘
+                │                          │
+                └──────────┬───────────────┘
+                           ▼
+              ┌────────────────────────┐
+              │  Inference / Evaluation│
+              │  (experiments_neurosymbolic.py)
+              │                        │
+              │  YOLO+Regressor detect │
+              │  current state → PDDL  │
+              │  plan → skill policies │
+              │  execute actions       │
+              └────────────────────────┘
+```
+
+---
+
+### Step 1 — Collect Demonstrations
+
+Demonstrations are collected automatically by having the PDDL planner generate a plan and an oracle executor carry it out in the Robosuite simulation.  Each successful episode is split by skill primitive and saved as a `.zip` file (containing a `data.pkl` trajectory) under `datasets/`.
+
+```bash
+python -m dataset_making.main \
+    --env Hanoi \
+    --episodes 150 \
+    --dir ./datasets \
+    --random-block-placement \
+    --random-block-selection \
+    --cube-init-pos-noise-std 0.01 \
+    --noisy-fraction 0.3 \
+    --noise-std 0.03
+```
+
+Key arguments:
+
+| Argument | Description |
+|---|---|
+| `--env` | Environment: `Hanoi`, `KitchenEnv`, `NutAssembly`, `CubeSorting` |
+| `--episodes` | Number of successful episodes to record |
+| `--random-block-placement` | Randomise initial block positions on pegs |
+| `--random-block-selection` | Randomly select 3 out of 4 available block types |
+| `--noisy-fraction` | Fraction of episodes that inject Gaussian action noise |
+| `--noise-std` | Standard deviation scale factor for the injected noise |
+
+**Output:** `datasets/<exp_name>/<exp_id>/traces/<skill>.zip`
+
+Each `.zip` contains a `data.pkl` file with a list of `(obs, action, keypoint)` tuples for that skill primitive.
+
+---
+
+### Step 2 — Process Data into Zarr Format
+
+Convert the collected pickle trajectories to [Zarr](https://zarr.readthedocs.io/) format, which is required by the diffusion policy training framework.
+
+```bash
+python -m neuro_symbolic_method.data_processing.data_to_zarr \
+    --data_dir ./datasets/<experiment_name>/<experiment_id>
+```
+
+**What this script does:**
+
+1. Reads all `.zip` trace files from `<data_dir>/traces/`.
+2. Groups transitions by skill type (e.g. `reach_pick`, `grasp`, `reach_place`, `drop`).
+3. For each skill, creates a `TrajectoryWithKeypoint` object with:
+   - `obs` — robot proprioceptive observations
+   - `acts` — end-effector delta actions
+   - `keypoint` — 3-D object keypoint positions
+4. Writes per-skill Zarr stores to `hf_traj/<skill>/keypoint/keypoint.zarr`.
+
+**Zarr store layout per skill:**
+
+```
+keypoint.zarr/
+├── data/
+│   ├── action      (T, action_dim)   float64
+│   ├── keypoint    (T, n_obj, kp_dim) float64
+│   └── state       (T, obs_dim)      float64
+└── meta/
+    └── episode_ends (n_episodes,)    int64
+```
+
+---
+
+### Step 3 — Train Object Detection and Pose Regression Models
+
+#### 3a. YOLOv8 Object Detection
+
+A YOLOv8 model is fine-tuned to detect task-relevant objects (blocks and pegs) from robot camera images.
+
+1. Annotate images using [Roboflow](https://roboflow.com) and export in YOLOv8 format.
+2. Train using the provided notebook or the CLI:
+
+```bash
+yolo task=detect mode=train \
+    model=yolov8s.pt \
+    data=<path_to_dataset>/data.yaml \
+    epochs=25 \
+    imgsz=800
+```
+
+Notebook location:
+```
+neuro_symbolic_method/objects_detection/train_yolov8_object_detection_on_custom_dataset.ipynb
+```
+
+Save the best weights to:
+```
+neuro_symbolic_method/models/yolo/<env>_yolo.pt
+```
+
+#### 3b. Pose Regression Model
+
+A lightweight regressor (e.g. scikit-learn) is trained to map YOLO bounding-box features to 3-D object positions.  Once trained, save the model to:
+
+```
+neuro_symbolic_method/models/regressors/<env>_regressor.pkl
+```
+
+---
+
+### Step 4 — Train Diffusion Skill Policies
+
+Each primitive skill (`reach_pick`, `grasp`, `reach_place`, `drop`) is trained as a separate diffusion policy using the [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) framework (submodule at `neuro_symbolic_method/diffusion_policy`).
+
+Initialise the submodule if you have not already:
+
+```bash
+git submodule update --init --recursive
+```
+
+Train each skill policy pointing at the corresponding Zarr dataset:
+
+```bash
+cd neuro_symbolic_method/diffusion_policy
+python train.py --config-name=train_diffusion_unet_lowdim_workspace \
+    task.dataset_path=../../hf_traj/<skill>/keypoint/keypoint.zarr
+```
+
+Repeat for each of the four skills: `reach_pick`, `grasp`, `reach_place` (reach-to-drop), and `drop`.
+
+After training, update the checkpoint paths in the environment config (e.g. `neuro_symbolic_method/config/hanoi.yaml`):
+
+```yaml
+policies:
+  grasp:       policies/noisy_30/grasp.ckpt
+  drop:        policies/noisy_30/drop.ckpt
+  reach_pick:  policies/noisy_30/reach_pick.ckpt
+  reach_place: policies/noisy_30/reach_drop.ckpt
+```
+
+---
+
+### Step 5 — (Optional) VLA Fine-tuning via pi0
+
+To fine-tune the pi0 VLA model on a new task:
+
+1. **Collect demonstrations** using `dataset_making/main.py` (VLA-friendly formatting is enforced automatically).
+2. **Convert to RLDS** using the [rlds_dataset_builder](rlds_dataset_builder/) submodule.
+3. **Fine-tune pi0** following the [openpi](openpi/) training instructions (see `openpi/` submodule, branch `ICRA2026`).
+
+After training, place the new checkpoint inside `openpi/checkpoints/` and update `openpi/examples/robosuite/config.yml` to point to it.
